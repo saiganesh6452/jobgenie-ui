@@ -1,0 +1,44 @@
+# Dependencies
+
+node_modules/
+
+# Build output
+
+dist/
+build/
+
+# Environment variables
+
+.env
+.env.local
+.env.development
+.env.production
+
+# Logs
+
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+
+# OS files
+
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor folders
+
+.vscode/
+.idea/
+
+# Cache
+
+.cache/
+.temp/
+tmp/
+
+# Coverage
+
+coverage/
+.nyc_output/
