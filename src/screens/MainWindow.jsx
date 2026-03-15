@@ -30,7 +30,7 @@ export default function MainWindow() {
     ipcRenderer.invoke('settings-get-theme').then(r => { if (r?.theme) setTheme(r.theme); }).catch(() => {});
     const h = (_, { theme: t }) => setTheme(t);
     ipcRenderer.on('theme-updated', h);
-    return () => ipcRenderer.removeAllListeners('theme-updated');
+    return () => ipcRenderer.removeListener('theme-updated', h);
   }, []);
 
   useEffect(() => {
@@ -39,7 +39,20 @@ export default function MainWindow() {
       if (type === 'SESSION_STARTED') setRecording(true);
     };
     ipcRenderer.on('state-update', onState);
-    return () => ipcRenderer.removeAllListeners('state-update');
+    return () => ipcRenderer.removeListener('state-update', onState);
+  }, []);
+
+  // ── setup-modal-start → main.js sends trigger-session-start here
+  // We invoke session-start (ipcMain.handle) which is the single source of truth
+  // for session creation. This avoids double-session creation.
+  useEffect(() => {
+    const onTrigger = (_, sessionData) => {
+      ipcRenderer.invoke('session-start', sessionData).catch(e => {
+        console.error('session-start failed:', e);
+      });
+    };
+    ipcRenderer.on('trigger-session-start', onTrigger);
+    return () => ipcRenderer.removeListener('trigger-session-start', onTrigger);
   }, []);
 
   useEffect(() => {

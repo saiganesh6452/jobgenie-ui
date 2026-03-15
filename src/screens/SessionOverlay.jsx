@@ -46,6 +46,16 @@ export default function SessionOverlay() {
   const [transcript,   setTranscript]   = useState([]);
   const [interim,      setInterim]      = useState({ system: '', mic: '' });
   const [answers,      setAnswers]      = useState([]);
+  const answersRef     = useRef([]);  // ← mirrors answers state; survives re-renders
+
+  // Safe setter — always updates both ref and state together
+  const pushAnswer     = useCallback((fn) => {
+    setAnswers(prev => {
+      const next = fn(prev);
+      answersRef.current = next;
+      return next;
+    });
+  }, []);
   const [streaming,    setStreaming]    = useState(false);
   const [autoMode,     setAutoMode]    = useState(true);
   const [speechStatus, setSpeechStatus] = useState('starting');
@@ -69,7 +79,7 @@ export default function SessionOverlay() {
       .catch(() => {});
     const handler = (_, { opacity: v }) => setOpacity(Number(v));
     ipcRenderer.on('opacity-updated', handler);
-    return () => ipcRenderer.removeAllListeners('opacity-updated');
+    return () => ipcRenderer.removeListener('opacity-updated', handler);
   }, []);
 
   const [theme, setTheme] = useState('light');
@@ -79,25 +89,27 @@ export default function SessionOverlay() {
       .catch(() => {});
     const handler = (_, { theme: t }) => setTheme(t);
     ipcRenderer.on('theme-updated', handler);
-    return () => ipcRenderer.removeAllListeners('theme-updated');
+    return () => ipcRenderer.removeListener('theme-updated', handler);
   }, []);
 
   const tk = THEMES[theme] ?? THEMES.light;
 
-  const txRef         = useRef(null);
-  const ansRef        = useRef(null);
-  const autoRef       = useRef(true);
-  const readyRef      = useRef(false);
-  const lastSentRef   = useRef('');
-  const lastQRef      = useRef('');
-  const sysRecRef     = useRef(null);
-  const micRecRef     = useRef(null);
-  const stoppingRef   = useRef(false);
-  const curAnsRef     = useRef('');
-  const sessionIdRef  = useRef(null);
+  const txRef        = useRef(null);
+  const ansRef       = useRef(null);
+  const autoRef      = useRef(true);
+  const readyRef     = useRef(false);
+  const lastSentRef  = useRef('');
+  const lastQRef     = useRef('');
+  const sysRecRef    = useRef(null);
+  const micRecRef    = useRef(null);
+  const stoppingRef  = useRef(false);
+  const curAnsRef    = useRef('');
+  const sessionIdRef = useRef(null);
   const transcriptRef = useRef([]);
-  const interimRef    = useRef({ system: '', mic: '' });
+  const interimRef   = useRef({ system: '', mic: '' });
+  // ── NEW: token refresh timer ref ─────────────────────────────────────────
   const tokenTimerRef = useRef(null);
+  // ── Reconnect cooldown — prevents 429 spam on Azure ──────────────────────
   const lastReconnectRef = useRef(0);
 
   useEffect(() => { autoRef.current = autoMode; }, [autoMode]);
@@ -105,10 +117,12 @@ export default function SessionOverlay() {
   useEffect(() => {
     if (showInput) {
       ipcRenderer.send('set-session-window-focusable', true);
+      // Temporarily show cursor when typing
       ipcRenderer.send('session-cursor-visible', true);
       setTimeout(() => { if (inputRef.current) inputRef.current.focus(); }, 150);
     } else {
       ipcRenderer.send('set-session-window-focusable', false);
+      // Hide cursor again when done typing
       ipcRenderer.send('session-cursor-visible', false);
     }
   }, [showInput]);
@@ -128,16 +142,7 @@ export default function SessionOverlay() {
 
   const sendQuestion = useCallback(text => {
     const q = (text || '').trim();
-    if (!q) return;
-
-    // ── FIX: dedup only blocks the exact same question sent twice in a row
-    // within a tight window. After response_end the ref is cleared so the
-    // same question CAN be asked again (e.g. after a screen capture).
-    if (q === lastSentRef.current) {
-      console.log('[sendQuestion] dedup — same question already in-flight, skipping');
-      return;
-    }
-
+    if (!q || q === lastSentRef.current) return;
     lastSentRef.current = q;
     lastQRef.current    = q;
     ipcRenderer.invoke('session-send-event', 'question', { content: q });
@@ -183,9 +188,11 @@ export default function SessionOverlay() {
         if (label === 'system' && autoRef.current) setTimeout(() => sendQuestion(t), 300);
       }
     };
+    // ── FIX: auto-reconnect with cooldown — prevents Azure 429 spam ──────
     rec.canceled = (_, e) => {
       if (stoppingRef.current) return;
       const now = Date.now();
+      // Max one reconnect attempt every 15 seconds
       if (now - lastReconnectRef.current < 15000) {
         console.warn(`[${label}] canceled but cooldown active — skipping reconnect`);
         return;
@@ -254,6 +261,7 @@ export default function SessionOverlay() {
         err  => { setSpeechStatus('error');   setErrorMsg(`Mic: ${err}`); signalReady(); },
       );
 
+      // ── FIX: Refresh Azure token every 9 min (token expires at 10 min) ──
       if (tokenTimerRef.current) clearInterval(tokenTimerRef.current);
       tokenTimerRef.current = setInterval(async () => {
         if (stoppingRef.current) return;
@@ -356,8 +364,6 @@ export default function SessionOverlay() {
         }).catch(reject);
       });
 
-      // ── FIX: clear dedup ref before sending so the question always goes
-      // through, even if it was the last question asked before capture
       lastSentRef.current = '';
       sendQuestion(qText);
 
@@ -375,8 +381,6 @@ export default function SessionOverlay() {
       || transcriptRef.current?.slice(-1)[0]?.text
       || interimText
       || 'Please provide assistance based on the conversation so far';
-    // ── FIX: always clear dedup before a manual Answer button press so it
-    // always fires even if the question text hasn't changed
     lastSentRef.current = '';
     sendQuestion(qText);
   }, [sendQuestion]);
@@ -387,8 +391,6 @@ export default function SessionOverlay() {
     addEntry(text, 'you');
     setManualInput('');
     setShowInput(false);
-    // ── FIX: clear dedup so manual typed questions always go through
-    lastSentRef.current = '';
     await triggerAnswer(text);
   }, [manualInput, addEntry, triggerAnswer]);
 
@@ -413,37 +415,29 @@ export default function SessionOverlay() {
     readyRef.current    = false;
     startSpeech();
 
+    // ── Hide cursor — prevents mouse showing during screen share ──────────
     ipcRenderer.send('session-window-ready-for-cursor-hide');
 
-    const onStart = () => {
-      // ── FIX: reset curAnsRef to '' and add a fresh answer card.
-      // Do NOT clear lastSentRef here — that would let duplicate questions
-      // through mid-stream. lastSentRef is cleared on response_end instead.
+    const onStart  = () => {
       curAnsRef.current = '';
       setStreaming(true);
-      setAnswers(p => [...p, { id: Date.now(), text: '', question: lastQRef.current }]);
+      pushAnswer(p => [...p, { id: Date.now(), text: '', question: lastQRef.current }]);
     };
-
     const onAnswer = (_, d) => {
       curAnsRef.current += (d.delta || '');
-      setAnswers(p => {
+      pushAnswer(p => {
         if (!p.length) return p;
         const u = [...p];
-        u[u.length - 1] = { ...u[u.length - 1], text: curAnsRef.current };
+        u[u.length-1] = { ...u[u.length-1], text: curAnsRef.current };
         return u;
       });
       setStreaming(true);
     };
-
-    const onEnd = () => {
+    const onEnd    = () => {
       setStreaming(false);
-      curAnsRef.current = '';
-      // ── FIX: clear dedup ref after response completes so the same
-      // question can be asked again (e.g. press Answer twice, or
-      // after a screen capture with the same question text)
-      lastSentRef.current = '';
+      curAnsRef.current   = '';
+      lastSentRef.current = ''; // ← clear dedup so next question always goes through
     };
-
     const onTx = (_, d) => {
       const t = d.text || d.transcript || d.content || '';
       if (t.trim()) {
@@ -452,8 +446,7 @@ export default function SessionOverlay() {
         addEntry(t.trim(), 'interviewer');
       }
     };
-
-    const onState = (_, { type, payload }) => {
+    const onState  = (_, { type, payload }) => {
       if (type === 'SESSION_CONNECTING' || type === 'SESSION_STARTED') {
         const sid = payload?.sessionId || payload?.id || payload?._id;
         if (sid) updSid(sid);
@@ -463,8 +456,7 @@ export default function SessionOverlay() {
       }
       if (type === 'SESSION_STOPPED') buildShareUrl();
     };
-
-    const onClean = () => { stoppingRef.current = true; stopAll(); };
+    const onClean  = () => { stoppingRef.current = true; stopAll(); };
 
     ipcRenderer.on('session-response-start', onStart);
     ipcRenderer.on('session-answer',          onAnswer);
@@ -475,9 +467,16 @@ export default function SessionOverlay() {
 
     return () => {
       stoppingRef.current = true; stopAll();
-      ['session-response-start', 'session-answer', 'session-response-end',
-       'transcript-update', 'state-update', 'cleanup-speech-service']
-        .forEach(e => ipcRenderer.removeAllListeners(e));
+      // ── CRITICAL FIX: use exact handler refs, NOT removeAllListeners
+      // removeAllListeners wipes every listener on the channel including
+      // ones registered by other useEffects (opacity, theme) which causes
+      // the answers panel to go blank mid-session
+      ipcRenderer.removeListener('session-response-start', onStart);
+      ipcRenderer.removeListener('session-answer',          onAnswer);
+      ipcRenderer.removeListener('session-response-end',    onEnd);
+      ipcRenderer.removeListener('transcript-update',       onTx);
+      ipcRenderer.removeListener('state-update',            onState);
+      ipcRenderer.removeListener('cleanup-speech-service',  onClean);
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -488,6 +487,14 @@ export default function SessionOverlay() {
     const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
     if (isNearBottom) el.scrollTop = el.scrollHeight;
   }, [answers]);
+
+  // ── RECOVERY: if React state got wiped but ref still has answers, restore ──
+  useEffect(() => {
+    if (answers.length === 0 && answersRef.current.length > 0) {
+      console.log('[ANSWERS] State wiped but ref has data — restoring', answersRef.current.length, 'answers');
+      setAnswers(answersRef.current);
+    }
+  });
 
   const micColor        = speechStatus === 'listening' ? tk.accent : speechStatus === 'error' ? tk.red : speechStatus === 'reconnecting' ? '#f59e0b' : tk.text3;
   const interimTxt      = interim.system || interim.mic || '';
@@ -659,7 +666,7 @@ export default function SessionOverlay() {
               ? <Empty color={tk.text3} label="Answers appear here..." icon="chat" />
               : answers.map((item, idx) => (
                 <div key={item.id} style={{
-                  marginBottom: idx < answers.length - 1 ? 10 : 0,
+                  marginBottom: idx < answers.length-1 ? 10 : 0,
                   animation:'fadeIn 0.2s ease',
                   background: theme === 'light' ? 'rgba(255,255,255,0.88)' : 'rgba(12,12,18,0.88)',
                   backdropFilter:'blur(12px)', WebkitBackdropFilter:'blur(12px)',
@@ -667,12 +674,12 @@ export default function SessionOverlay() {
                 }}>
                   {item.question && (
                     <div style={{ fontSize:10, color:tk.blue, marginBottom:5, fontFamily:'DM Mono, monospace', fontWeight:600 }}>
-                      Q: {item.question.length > 90 ? item.question.slice(0, 90) + '…' : item.question}
+                      Q: {item.question.length > 90 ? item.question.slice(0,90)+'…' : item.question}
                     </div>
                   )}
                   <div style={{ fontSize:13, color: answerTextColor, lineHeight:1.8, whiteSpace:'pre-wrap' }}>
                     {item.text}
-                    {streaming && idx === answers.length - 1 && (
+                    {streaming && idx === answers.length-1 && (
                       <span style={{ display:'inline-block', width:2, height:14, background:tk.blue, marginLeft:3, verticalAlign:'middle', animation:'cursor 0.8s ease infinite' }} />
                     )}
                   </div>
